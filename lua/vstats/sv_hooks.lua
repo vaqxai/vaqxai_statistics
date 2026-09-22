@@ -40,6 +40,43 @@ timer.Create("vstats_install_addmoney", 1, 0, function()
     if installAddMoneyWrapper() then timer.Remove("vstats_install_addmoney") end
 end)
 
+-- Wrap vLevels.AddXP the same way, so XP awarded via the generic "script"/
+-- "money" reasons gets attributed to the addon that actually triggered it,
+-- instead of just that generic label. Recursive calls (e.g. the dweller
+-- bonus, which calls AddXP again from inside AddXP) are handled with a
+-- save/restore of the pending source rather than a flat overwrite.
+local function installAddXPWrapper()
+    if vstats._addXPWrapped then return true end
+    if not vLevels or not isfunction(vLevels.AddXP) then return false end
+
+    local oldAddXP = vLevels.AddXP
+    function vLevels.AddXP(ply, category, amount, isDwellerBonus, source)
+        local callSource = vstats.GetXPCallSource(3)
+        local previousPending = vstats._pendingXPCallSource
+        vstats._pendingXPCallSource = callSource
+
+        local a, b, c, d = oldAddXP(ply, category, amount, isDwellerBonus, source)
+
+        vstats._pendingXPCallSource = previousPending
+        return a, b, c, d
+    end
+
+    vstats._addXPWrapped = true
+    timer.Remove("vstats_install_addxp")
+    print("[vStats] vLevels.AddXP tracking installed.")
+    return true
+end
+
+installAddXPWrapper()
+
+hook.Add("PostGamemodeLoaded", "vstats_InstallAddXPWrapper", function()
+    installAddXPWrapper()
+end)
+
+timer.Create("vstats_install_addxp", 1, 0, function()
+    if installAddXPWrapper() then timer.Remove("vstats_install_addxp") end
+end)
+
 hook.Add("PlayerInitialSpawn", "vstats_PlayerInitialSpawn", function(ply)
     ply.vstats_job = ply:Team()
     ply.vstats_jobSince = CurTime()
@@ -110,7 +147,13 @@ end)
 
 hook.Add("vlevels_XPAwarded", "vstats_RecordXP", function(ply, category, amount, source)
     if not IsValid(ply) then return end
-    vstats.RecordXP(vstats.GetJobName(ply:Team()), category, source, amount)
+
+    -- Prefer the addon the call actually traced back to; only fall back to
+    -- vLevels' own human label ("playtime", "dweller_bonus", ...) when no
+    -- external addon was found on the stack (a genuine vLevels-internal grant).
+    local callSource = vstats._pendingXPCallSource
+    local resolvedSource = (callSource and callSource ~= "other") and callSource or (source or "script")
+    vstats.RecordXP(vstats.GetJobName(ply:Team()), category, resolvedSource, amount)
 end)
 
 hook.Add("RCD:VehicleAcquired", "vstats_VehicleAcquired", function(_, _, vehicleID, acquisition)

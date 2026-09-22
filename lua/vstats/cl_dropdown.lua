@@ -7,6 +7,14 @@ function PANEL:Init()
     self.selectedID = nil
     self.selectedLabel = ""
     self:SetCursor("hand")
+    self:SetMouseInputEnabled(true)
+end
+
+-- The open menu is a separate top-level popup (not a child of this panel), so
+-- it must be cleaned up explicitly, otherwise closing the window while a
+-- dropdown is open would leave it behind holding the popup/cursor state.
+function PANEL:OnRemove()
+    if IsValid(self.menu) then self.menu:Remove() end
 end
 
 -- Sets the available choices ({ {id=, label=}, ... }). If selectID is given,
@@ -94,6 +102,7 @@ function PANEL:OpenMenu()
         row:SetPos(1, (i - 1) * rowHeight)
         row:SetSize(width - 2, rowHeight)
         row:SetCursor("hand")
+        row:SetMouseInputEnabled(true)
         row.Paint = function(rowPanel, w, h)
             if choice.id == self.selectedID or rowPanel:IsHovered() then
                 surface.SetDrawColor(vstats.COLORS.rowSelected)

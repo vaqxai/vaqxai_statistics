@@ -54,6 +54,17 @@ function vstats.IsExcludedMoneySource(source)
     return false
 end
 
+-- Pre-job placeholder "teams" (before a player has connected fully / picked a
+-- DarkRP job), not real jobs. Excluded from the all-jobs overview.
+vstats.JOB_EXCLUSIONS = {
+    ["Joining/Connecting"] = true,
+    ["Unassigned"] = true,
+}
+
+function vstats.IsExcludedJob(job)
+    return vstats.JOB_EXCLUSIONS[job] == true
+end
+
 vstats.RANGES = {
     { id = "24h", label = "Last 24 hours", seconds = 86400 },
     { id = "7d", label = "Last 7 days", seconds = 604800 },

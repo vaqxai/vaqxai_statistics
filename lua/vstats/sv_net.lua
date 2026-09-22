@@ -42,4 +42,9 @@ concommand.Add("vstats_print_money_sources", function(ply)
     vstats.PrintMoneySourceDebug()
 end)
 
+concommand.Add("vstats_print_xp_sources", function(ply)
+    if IsValid(ply) then return end
+    vstats.PrintXPSourceDebug()
+end)
+
 print("[vStats] Net (SV) Loaded.")

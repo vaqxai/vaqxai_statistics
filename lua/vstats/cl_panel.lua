@@ -31,24 +31,52 @@ function PANEL:Init()
     end)
 end
 
+-- MakePopup grabs the cursor/keyboard; without this, closing a plain
+-- EditablePanel (unlike DFrame) can leave the game thinking a popup is still
+-- open, so the cursor never gets released back to the game.
+function PANEL:OnRemove()
+    gui.EnableScreenClicker(false)
+end
+
 function PANEL:BuildTitleBar()
     local barHeight = vstats.Scaled(34)
 
     local titlebar = self:Add("EditablePanel")
     titlebar:Dock(TOP)
     titlebar:SetTall(barHeight)
-    titlebar:SetDraggable(true)
-    titlebar:SetDragParent(self)
+    titlebar:SetMouseInputEnabled(true)
     titlebar.Paint = function(_, w, h)
         surface.SetDrawColor(vstats.COLORS.titlebar)
         surface.DrawRect(0, 0, w, h)
         draw.SimpleText("Server Balance Statistics", "VStats_Title", vstats.Scaled(10), h / 2, vstats.COLORS.titleText, TEXT_ALIGN_LEFT, TEXT_ALIGN_CENTER)
     end
 
+    -- EditablePanel has no built-in dragging (that's DFrame-only), so drag is
+    -- reimplemented the same way DFrame itself does it internally: capture the
+    -- mouse on press and reposition the window from a Think poll.
+    titlebar.OnMousePressed = function(pnl, mcode)
+        if mcode ~= MOUSE_LEFT then return end
+        pnl.dragOffsetX = gui.MouseX() - self.x
+        pnl.dragOffsetY = gui.MouseY() - self.y
+        pnl.dragging = true
+        pnl:MouseCapture(true)
+    end
+    titlebar.OnMouseReleased = function(pnl)
+        pnl.dragging = false
+        pnl:MouseCapture(false)
+    end
+    titlebar.Think = function(pnl)
+        if not pnl.dragging then return end
+        local mx = math.Clamp(gui.MouseX(), 0, ScrW())
+        local my = math.Clamp(gui.MouseY(), 0, ScrH())
+        self:SetPos(mx - pnl.dragOffsetX, my - pnl.dragOffsetY)
+    end
+
     local closeButton = titlebar:Add("EditablePanel")
     closeButton:Dock(RIGHT)
     closeButton:SetWide(barHeight)
     closeButton:SetCursor("hand")
+    closeButton:SetMouseInputEnabled(true)
     closeButton.Paint = function(btn, w, h)
         if btn:IsHovered() then
             surface.SetDrawColor(200, 60, 60, 255)

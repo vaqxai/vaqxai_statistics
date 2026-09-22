@@ -111,11 +111,12 @@ local function isMoneyBridgePath(path)
         or string.find(path, "zclib/util/sv_money.lua", 1, true) ~= nil
 end
 
--- Produces a bounded source tag from the Lua caller. It deliberately stores
--- only the classification in SQLite, never the file/function/stack trace.
-function vstats.GetMoneySource(stackLevel)
+-- Walks the Lua call stack from firstLevel looking for the first frame that
+-- isn't inside vstats itself or one of the caller-supplied "bridge" paths
+-- (a shared helper file that isn't the real originating addon). Returns the
+-- classification tag plus the raw path it was derived from (for debugging).
+local function resolveCallSource(firstLevel, isBridgePath)
     local path = ""
-    local firstLevel = stackLevel or 3
 
     for level = firstLevel, firstLevel + 6 do
         local info = debug.getinfo(level, "S")
@@ -124,13 +125,19 @@ function vstats.GetMoneySource(stackLevel)
         local candidate = info.source or info.short_src or ""
         candidate = string.lower(string.Replace(string.gsub(candidate, "^@", ""), "\\", "/"))
         if candidate ~= "" and not string.find(candidate, "vstats/", 1, true)
-            and candidate ~= "=[c]" and not isMoneyBridgePath(candidate) then
+            and candidate ~= "=[c]" and not (isBridgePath and isBridgePath(candidate)) then
             path = candidate
             break
         end
     end
 
-    local source = classifyMoneyPath(path)
+    return classifyMoneyPath(path), path
+end
+
+-- Produces a bounded source tag from the Lua caller. It deliberately stores
+-- only the classification in SQLite, never the file/function/stack trace.
+function vstats.GetMoneySource(stackLevel)
+    local source, path = resolveCallSource(stackLevel or 3, isMoneyBridgePath)
     rememberMoneySource(path ~= "" and path or "<unknown>", source)
     return source
 end
@@ -147,6 +154,45 @@ function vstats.PrintMoneySourceDebug()
     end
 end
 
+vstats._xpSourceDebug = vstats._xpSourceDebug or {}
+vstats._xpSourceDebugCount = vstats._xpSourceDebugCount or 0
+
+local function rememberXPSource(path, source)
+    if vstats._xpSourceDebug[path] then return end
+    if vstats._xpSourceDebugCount >= 100 then return end
+
+    vstats._xpSourceDebug[path] = source
+    vstats._xpSourceDebugCount = vstats._xpSourceDebugCount + 1
+end
+
+local function isVLevelsBridgePath(path)
+    return string.find(path, "addons/vaqxais_levels/", 1, true) ~= nil
+end
+
+-- Same idea as vstats.GetMoneySource, but skips vLevels' own files so calls
+-- relayed through vLevels.AddXP/AddXPForMoney/AddXPForKill attribute back to
+-- whichever addon actually triggered the XP grant, not vLevels itself.
+-- Returns "other" when no such addon frame is found (e.g. vLevels' own
+-- playtime/dweller-bonus ticks), which callers use to fall back to whatever
+-- human-readable reason the caller labelled the grant with.
+function vstats.GetXPCallSource(stackLevel)
+    local source, path = resolveCallSource(stackLevel or 3, isVLevelsBridgePath)
+    rememberXPSource(path ~= "" and path or "<unknown>", source)
+    return source
+end
+
+function vstats.PrintXPSourceDebug()
+    print("[vStats] Observed XP caller classifications:")
+    print("[vStats] vLevels.AddXP wrapper installed: " .. tostring(vstats._addXPWrapped == true))
+    if vstats._xpSourceDebugCount == 0 then
+        print("[vStats] No vLevels.AddXP calls have been observed since this Lua state started.")
+        return
+    end
+    for path, source in SortedPairs(vstats._xpSourceDebug) do
+        print(string.format("[vStats] %s -> %s", path, source))
+    end
+end
+
 function vstats.FindConfig(list, id)
     for _, item in ipairs(list) do
         if item.id == id then return item end
@@ -158,7 +204,7 @@ local function addTo(acc, key, amount)
 end
 
 function vstats.RecordJobPlaytime(job, seconds)
-    if not job or seconds <= 0 then return end
+    if not job or seconds <= 0 or vstats.IsExcludedJob(job) then return end
     addTo(vstats._acc.job_playtime, job, seconds)
 end
 
@@ -166,7 +212,7 @@ end
 -- in reports without waiting for the periodic aggregate flush.
 function vstats.WriteJobPlaytime(job, seconds)
     seconds = math.floor(tonumber(seconds) or 0)
-    if not job or seconds <= 0 then return end
+    if not job or seconds <= 0 or vstats.IsExcludedJob(job) then return end
 
     local result = sql.Query(string.format(
         "INSERT INTO vstats_job_playtime (job, bucket, seconds) VALUES (%s, %d, %d)",
@@ -183,19 +229,19 @@ local function addNested(acc, first, second, amount)
 end
 
 function vstats.RecordJobIncome(job, amount, source)
-    if not job or amount <= 0 then return end
+    if not job or amount <= 0 or vstats.IsExcludedJob(job) then return end
     addTo(vstats._acc.job_income, job, amount)
     addNested(vstats._acc.job_income_source, job, source or "other", amount)
 end
 
 function vstats.RecordJobSpend(job, amount, source)
-    if not job or amount <= 0 then return end
+    if not job or amount <= 0 or vstats.IsExcludedJob(job) then return end
     addTo(vstats._acc.job_spend, job, amount)
     addNested(vstats._acc.job_spend_source, job, source or "other", amount)
 end
 
 function vstats.RecordXP(job, category, source, amount)
-    if not job or not category or not isnumber(amount) or amount <= 0 then return end
+    if not job or not category or not isnumber(amount) or amount <= 0 or vstats.IsExcludedJob(job) then return end
 
     local key = job .. "\31" .. category
     addNested(vstats._acc.xp_earned, key, source or "script", amount)
@@ -274,7 +320,9 @@ local function samplePopulation(bucket)
     local counts = {}
     for _, ply in ipairs(player.GetAll()) do
         local job = vstats.GetJobName(ply:Team())
-        counts[job] = (counts[job] or 0) + 1
+        if not vstats.IsExcludedJob(job) then
+            counts[job] = (counts[job] or 0) + 1
+        end
     end
 
     for job, count in pairs(counts) do
