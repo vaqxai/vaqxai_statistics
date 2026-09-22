@@ -14,12 +14,18 @@ if SERVER then
     AddCSLuaFile("vstats/cl_net.lua")
     AddCSLuaFile("vstats/cl_hooks.lua")
     AddCSLuaFile("vstats/cl_util.lua")
+    AddCSLuaFile("vstats/cl_theme.lua")
+    AddCSLuaFile("vstats/cl_dropdown.lua")
+    AddCSLuaFile("vstats/cl_list.lua")
     AddCSLuaFile("vstats/cl_graph.lua")
     AddCSLuaFile("vstats/cl_panel.lua")
 end
 
 if CLIENT then
     include("vstats/cl_util.lua")
+    include("vstats/cl_theme.lua")
+    include("vstats/cl_dropdown.lua")
+    include("vstats/cl_list.lua")
     include("vstats/cl_graph.lua")
     include("vstats/cl_panel.lua")
     include("vstats/cl_net.lua")
