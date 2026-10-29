@@ -4,6 +4,12 @@
 -- correctly on high resolution (4K+) displays.
 local PANEL = {}
 
+local function categoryUsesJobFilter(categoryID)
+    return categoryID == "money_income_source"
+        or categoryID == "money_spend_source"
+        or categoryID == "money_net_source"
+end
+
 function PANEL:Init()
     self:SetSize(math.Round(ScrW() * 0.7), math.Round(ScrH() * 0.75))
     self:Center()
@@ -91,6 +97,12 @@ function PANEL:BuildTitleBar()
 end
 
 function PANEL:BuildFilters()
+    local function defaultMoneyFilterChoices(isJobFilter)
+        return { { id = "", label = isJobFilter and "All jobs" or "All money sources" } }
+    end
+
+
+
     local filters = self:Add("EditablePanel")
     filters:Dock(TOP)
     filters:SetTall(vstats.Scaled(40))
@@ -111,15 +123,25 @@ function PANEL:BuildFilters()
     end
     self.category:SetChoices(categoryChoices, self.categoryID)
     self.category.OnSelect = function(_, id)
+        local previousCategoryID = self.categoryID
         self.categoryID = id
         self.selectedKey = ""
 
         local category = vstats.FindConfig(vstats.CATEGORIES, id)
         local isMoney = category and category.unit == "money"
+        local wasJobFilter = categoryUsesJobFilter(previousCategoryID)
+        local isJobFilter = categoryUsesJobFilter(id)
+
+        if isMoney and wasJobFilter ~= isJobFilter then
+            self.sourceID = ""
+            self.sourceOptionsKey = nil
+            self.source:SetChoices(defaultMoneyFilterChoices(isJobFilter), "")
+        end
+
         if not isMoney then
             self.sourceID = ""
             self.sourceOptionsKey = nil
-            self.source:SetChoices({ { id = "", label = "All money sources" } }, "")
+            self.source:SetChoices(defaultMoneyFilterChoices(false), "")
         end
         self.source:SetVisible(isMoney)
         self:RefreshReport()
@@ -144,7 +166,7 @@ function PANEL:BuildFilters()
     self.source:Dock(LEFT)
     self.source:SetWide(vstats.Scaled(240))
     self.source:DockMargin(0, 0, vstats.Scaled(8), 0)
-    self.source:SetChoices({ { id = "", label = "All money sources" } }, "")
+    self.source:SetChoices(defaultMoneyFilterChoices(categoryUsesJobFilter(self.categoryID)), "")
     self.source:SetVisible(false)
     self.source.OnSelect = function(_, id)
         self.sourceID = id or ""
@@ -194,15 +216,20 @@ function PANEL:ApplyReport(report)
     local category = vstats.FindConfig(vstats.CATEGORIES, self.categoryID)
     if not category then return end
 
-    local usesMoneySources = category.unit == "money"
-    self.source:SetVisible(usesMoneySources)
-    if usesMoneySources then
-        local optionsKey = table.concat(report.sources or {}, "\31")
+    local usesMoneyFilter = category.unit == "money"
+    local usesJobFilter = categoryUsesJobFilter(self.categoryID)
+    self.source:SetVisible(usesMoneyFilter)
+    if usesMoneyFilter then
+        local options = usesJobFilter and (report.jobs or {}) or (report.sources or {})
+        local optionsKey = (usesJobFilter and "jobs\31" or "sources\31") .. table.concat(options, "\31")
         if self.sourceOptionsKey ~= optionsKey then
             self.sourceOptionsKey = optionsKey
-            local choices = { { id = "", label = "All money sources" } }
-            for _, source in ipairs(report.sources or {}) do
-                choices[#choices + 1] = { id = source, label = string.Replace(source, ":", ": ") }
+            local choices = { { id = "", label = usesJobFilter and "All jobs" or "All money sources" } }
+            for _, option in ipairs(options) do
+                choices[#choices + 1] = {
+                    id = option,
+                    label = usesJobFilter and option or string.Replace(option, ":", ": ")
+                }
             end
             self.source:SetChoices(choices, self.sourceID)
         end

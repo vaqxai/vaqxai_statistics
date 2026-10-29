@@ -1,4 +1,4 @@
-vstats.FLUSH_INTERVAL = 900 -- seconds between bucket flushes (15 min)
+vstats.FLUSH_INTERVAL = 60 -- seconds between bucket flushes (1 min)
 vstats.WEAPON_SCAN_INTERVAL = 60 -- seconds between weapon-inventory scans
 vstats.PERMISSION = "vstats_view"
 
@@ -70,18 +70,25 @@ vstats.RANGES = {
     { id = "7d", label = "Last 7 days", seconds = 604800 },
     { id = "30d", label = "Last 30 days", seconds = 2592000 },
     { id = "all", label = "All time", seconds = nil },
+    -- Follows the last vaqxai_balancing change (or `!vstats mark`); label is set by the server.
+    { id = "mark", label = "Since last balancing", mark = true },
 }
+
+-- Hours added to the UTC server clock for mark input/display (Polish time:
+-- 2 for CEST, 1 for CET after the last Sunday of October).
+vstats.TIME_OFFSET_HOURS = 2
 
 vstats.CATEGORIES = {
     { id = "job_playtime", label = "Job Playtime", unit = "seconds" },
     { id = "job_income", label = "Job Income", unit = "money" },
     { id = "job_spend", label = "Job Spend", unit = "money" },
-    { id = "job_netprofit", label = "Job Net Profit", unit = "money" },
+    { id = "job_netprofit", label = "Job Net Profit / Player", unit = "money" },
     { id = "money_income_source", label = "Income by Source", unit = "money" },
     { id = "money_spend_source", label = "Spend by Source", unit = "money" },
     { id = "money_net_source", label = "Net Money by Source", unit = "money" },
     { id = "job_population", label = "Job Population (avg)", unit = "count" },
     { id = "job_income_per_hour", label = "Job $ / Hour", unit = "money" },
+    { id = "job_netprofit_per_hour", label = "Job Net Profit / Hour", unit = "money" },
     { id = "xp_category", label = "XP by Category", unit = "xp" },
     { id = "xp_job", label = "XP by Job", unit = "xp" },
     { id = "xp_source", label = "XP by Source", unit = "xp" },

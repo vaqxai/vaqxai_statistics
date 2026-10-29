@@ -10,6 +10,7 @@ if SERVER then
     include("vstats/sv_net.lua")
     include("vstats/sv_hooks.lua")
     include("vstats/sv_util.lua")
+    include("vstats/sv_mark.lua")
 
     AddCSLuaFile("vstats/cl_net.lua")
     AddCSLuaFile("vstats/cl_hooks.lua")

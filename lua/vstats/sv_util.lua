@@ -1,5 +1,6 @@
 -- In-memory accumulators, flushed to the DB every vstats.FLUSH_INTERVAL seconds.
-vstats._acc = {
+-- Kept across reloads (Lua autorefresh) so unflushed data isn't lost.
+vstats._acc = vstats._acc or {
     job_playtime = {},
     job_income = {},
     job_spend = {},
@@ -134,10 +135,60 @@ local function resolveCallSource(firstLevel, isBridgePath)
     return classifyMoneyPath(path), path
 end
 
+-- DarkRP routes dropping money (/dropmoney) through the same file as /give and
+-- other money commands, so path classification can't tell them apart. Instead
+-- match the actual /dropmoney callback on the stack, and the spawned_money
+-- entity's file for pickups.
+local function detectDarkRPMoneyFlow()
+    local dropCmd = DarkRP and DarkRP.getChatCommand and DarkRP.getChatCommand("dropmoney")
+    local dropFn = dropCmd and dropCmd.callback
+
+    for level = 1, 12 do
+        local info = debug.getinfo(level, "Sf")
+        if not info then break end
+
+        if dropFn and info.func == dropFn then return "darkrp:dropped_money" end
+
+        local src = string.lower(string.Replace(info.source or "", "\\", "/"))
+        if string.find(src, "entities/spawned_money/", 1, true) then
+            return "darkrp:picked_up_money"
+        end
+    end
+end
+
+vstats.FIX_SOURCES = {
+    ch_printers_withdraw = "printer:ch_printers",
+    realistic_police = "script:realistic_police_1.9.6",
+    cocaine_sell = "script:the_cocaine_factory",
+    executioner_bonus = "script:executioner_v2",
+    refund_money = "script:darkrp_refund",
+    luctus_refunds = "script:luctus_refunds",
+    bks_sell_owner = "script:beekeeping_system",
+    properties_rent = "script:realistic_properties_v1.5.3",
+    ztm_buyermachine_owner = "script:zeros_trashman_v1.6.3",
+}
+
 -- Produces a bounded source tag from the Lua caller. It deliberately stores
 -- only the classification in SQLite, never the file/function/stack trace.
 function vstats.GetMoneySource(stackLevel)
+    local special = detectDarkRPMoneyFlow()
+    if special then
+        rememberMoneySource("<stack:" .. special .. ">", special)
+        return special
+    end
+
     local source, path = resolveCallSource(stackLevel or 3, isMoneyBridgePath)
+    -- Lottery tickets and prizes are player-to-player transfers; tag them
+    -- apart from the rest of ch_mayor so they don't read as job earnings.
+    if string.find(path, "ch_mayor_lottery.lua", 1, true) then
+        source = "script:ch_mayor:lottery"
+    end
+    -- vaqxai_exploitfixes re-registers handlers of other addons; book that
+    -- money under the addon it really belongs to.
+    local fix = string.match(path, "vxfix_([%w_]+)")
+    if fix and vstats.FIX_SOURCES[fix] then
+        source = vstats.FIX_SOURCES[fix]
+    end
     rememberMoneySource(path ~= "" and path or "<unknown>", source)
     return source
 end
@@ -630,6 +681,61 @@ local function populationSeries(selectedKey, sinceTimestamp, groupSeconds)
     return queryRows(query, true)
 end
 
+local function netProfitPerPlayerTotals(sinceTimestamp, incomeTable, spendTable, keyColumn, extraWhere)
+    local filter = timeWhere(sinceTimestamp) .. (extraWhere or "")
+    local query = string.format([[
+        SELECT n.key AS key, (n.total * 1.0 / d.total) AS total
+        FROM (
+            SELECT %s AS key, SUM(total) AS total FROM (
+                SELECT %s AS key, SUM(amount) AS total FROM %s WHERE 1=1%s GROUP BY %s
+                UNION ALL
+                SELECT %s AS key, -SUM(amount) AS total FROM %s WHERE 1=1%s GROUP BY %s
+            ) GROUP BY key
+        ) n
+        JOIN (
+            SELECT population.job AS key, (SUM(population.count) * 1.0 / samples.total) AS total
+            FROM (
+                SELECT job, bucket, AVG(count) AS count FROM vstats_job_population
+                WHERE 1=1%s GROUP BY job, bucket
+            ) population
+            CROSS JOIN (SELECT COUNT(DISTINCT bucket) AS total FROM vstats_job_population WHERE 1=1%s) samples
+            WHERE samples.total > 0
+            GROUP BY population.job
+        ) d ON d.key = n.key
+        WHERE d.total > 0 ORDER BY total DESC
+    ]], keyColumn, keyColumn, incomeTable, filter, keyColumn, keyColumn, spendTable, filter, keyColumn, filter, filter)
+    return queryRows(query, false)
+end
+
+local function netProfitPerPlayerSeries(selectedKey, sinceTimestamp, groupSeconds, incomeTable, spendTable, keyColumn, extraWhere)
+    local escaped = sql.SQLStr(selectedKey)
+    local filter = timeWhere(sinceTimestamp) .. (extraWhere or "")
+    local query = string.format([[
+        SELECT samples.grouped_bucket AS grouped_bucket,
+            (COALESCE(profit.total, 0) * 1.0 / population.total) AS value
+        FROM (
+            SELECT (bucket - (bucket %% %d)) AS grouped_bucket, COUNT(DISTINCT bucket) AS total
+            FROM vstats_job_population WHERE 1=1%s GROUP BY grouped_bucket
+        ) samples
+        LEFT JOIN (
+            SELECT (bucket - (bucket %% %d)) AS grouped_bucket, SUM(count) AS total FROM (
+                SELECT bucket, AVG(count) AS count FROM vstats_job_population
+                WHERE job = %s%s GROUP BY bucket
+            ) GROUP BY grouped_bucket
+        ) population ON population.grouped_bucket = samples.grouped_bucket
+        LEFT JOIN (
+            SELECT grouped_bucket, SUM(value) AS total FROM (
+                SELECT (bucket - (bucket %% %d)) AS grouped_bucket, SUM(amount) AS value FROM %s WHERE %s = %s%s GROUP BY grouped_bucket
+                UNION ALL
+                SELECT (bucket - (bucket %% %d)) AS grouped_bucket, -SUM(amount) AS value FROM %s WHERE %s = %s%s GROUP BY grouped_bucket
+            ) GROUP BY grouped_bucket
+        ) profit ON profit.grouped_bucket = samples.grouped_bucket
+        WHERE population.total > 0
+        ORDER BY samples.grouped_bucket ASC
+    ]], groupSeconds, filter, groupSeconds, keyColumn, escaped, filter, groupSeconds, incomeTable, keyColumn, escaped, filter, groupSeconds, spendTable, keyColumn, escaped, filter)
+    return queryRows(query, true)
+end
+
 local function queryMoneySources()
     local result = sql.Query([[
         SELECT source FROM (
@@ -646,6 +752,22 @@ local function queryMoneySources()
     return sources
 end
 
+local function queryMoneySourceJobs()
+    local result = sql.Query([[
+        SELECT job FROM (
+            SELECT DISTINCT job FROM vstats_job_income_source
+            UNION
+            SELECT DISTINCT job FROM vstats_job_spend_source
+        ) ORDER BY job ASC
+    ]]) or {}
+
+    local jobs = {}
+    for _, row in ipairs(result) do
+        if isstring(row.job) and row.job ~= "" then jobs[#jobs + 1] = row.job end
+    end
+    return jobs
+end
+
 function vstats.BuildReport(categoryID, rangeID, selectedKey, sourceFilter)
     local category = vstats.FindConfig(vstats.CATEGORIES, categoryID)
     local range = vstats.FindConfig(vstats.RANGES, rangeID)
@@ -653,9 +775,16 @@ function vstats.BuildReport(categoryID, rangeID, selectedKey, sourceFilter)
 
     sourceFilter = category.unit == "money" and tostring(sourceFilter or "") or ""
     local sourceWhere = sourceFilter ~= "" and (" AND source = " .. sql.SQLStr(sourceFilter)) or ""
+    local jobWhere = sourceFilter ~= "" and (" AND job = " .. sql.SQLStr(sourceFilter)) or ""
 
     local sinceTimestamp = range.seconds and (os.time() - range.seconds) or nil
-    local groupSeconds = vstats.PickGroupSeconds(range.seconds)
+    local spanSeconds = range.seconds
+    if range.mark then
+        sinceTimestamp = vstats.MarkSince and vstats.MarkSince()
+        if not sinceTimestamp then return nil end
+        spanSeconds = math.max(os.time() - sinceTimestamp, 0)
+    end
+    local groupSeconds = vstats.PickGroupSeconds(spanSeconds)
     local totals
     local series = {}
 
@@ -670,7 +799,7 @@ function vstats.BuildReport(categoryID, rangeID, selectedKey, sourceFilter)
                 reportDefinition = { tableName = "vstats_job_spend_source", key = "job", value = "amount", aggregate = "SUM" }
                 reportWhere = sourceWhere
             elseif categoryID == "money_income_source" or categoryID == "money_spend_source" then
-                reportWhere = sourceWhere
+                reportWhere = jobWhere
             end
         end
 
@@ -686,23 +815,92 @@ function vstats.BuildReport(categoryID, rangeID, selectedKey, sourceFilter)
     elseif categoryID == "job_netprofit" then
         local incomeTable = sourceFilter ~= "" and "vstats_job_income_source" or "vstats_job_income"
         local spendTable = sourceFilter ~= "" and "vstats_job_spend_source" or "vstats_job_spend"
-        totals = netProfitTotals(sinceTimestamp, incomeTable, spendTable, "job", sourceWhere)
+
+        local populationByJob = {}
+        for _, row in ipairs(populationTotals(sinceTimestamp)) do
+            populationByJob[row.key] = tonumber(row.total) or 0
+        end
+
+        totals = {}
+        for _, row in ipairs(netProfitTotals(sinceTimestamp, incomeTable, spendTable, "job", sourceWhere)) do
+            local population = populationByJob[row.key]
+            if population and population > 0 then
+                totals[#totals + 1] = {
+                    key = row.key,
+                    total = (tonumber(row.total) or 0) / population
+                }
+            end
+        end
+        table.sort(totals, function(a, b)
+            return (tonumber(a.total) or 0) > (tonumber(b.total) or 0)
+        end)
+
         if selectedKey and selectedKey ~= "" then
-            series = netProfitSeries(selectedKey, sinceTimestamp, groupSeconds,
-                incomeTable, spendTable, "job", sourceWhere)
+            local populationByBucket = {}
+            for _, row in ipairs(populationSeries(selectedKey, sinceTimestamp, groupSeconds)) do
+                populationByBucket[row.bucket] = tonumber(row.value) or 0
+            end
+
+            series = {}
+            for _, row in ipairs(netProfitSeries(selectedKey, sinceTimestamp, groupSeconds,
+                incomeTable, spendTable, "job", sourceWhere)) do
+                local population = populationByBucket[row.bucket]
+                if population and population > 0 then
+                    series[#series + 1] = {
+                        bucket = row.bucket,
+                        value = (tonumber(row.value) or 0) / population
+                    }
+                end
+            end
         end
     elseif categoryID == "money_net_source" then
         totals = netProfitTotals(sinceTimestamp,
-            "vstats_job_income_source", "vstats_job_spend_source", "source", sourceWhere)
+            "vstats_job_income_source", "vstats_job_spend_source", "source", jobWhere)
         if selectedKey and selectedKey ~= "" then
             series = netProfitSeries(selectedKey, sinceTimestamp, groupSeconds,
-                "vstats_job_income_source", "vstats_job_spend_source", "source", sourceWhere)
+                "vstats_job_income_source", "vstats_job_spend_source", "source", jobWhere)
         end
     elseif categoryID == "job_income_per_hour" then
         local incomeTable = sourceFilter ~= "" and "vstats_job_income_source" or "vstats_job_income"
         totals = ratioTotals(incomeTable, "amount", "vstats_job_playtime", "seconds", "job", sinceTimestamp, 3600, sourceWhere)
         if selectedKey and selectedKey ~= "" then
             series = ratioSeries(incomeTable, "amount", "vstats_job_playtime", "seconds", "job", selectedKey, sinceTimestamp, groupSeconds, 3600, sourceWhere)
+        end
+    elseif categoryID == "job_netprofit_per_hour" then
+        local incomeTable = sourceFilter ~= "" and "vstats_job_income_source" or "vstats_job_income"
+        local spendTable = sourceFilter ~= "" and "vstats_job_spend_source" or "vstats_job_spend"
+        local playtimeDef = REPORTS.job_playtime
+
+        local hoursByJob = {}
+        for _, row in ipairs(simpleTotals(playtimeDef, sinceTimestamp)) do
+            hoursByJob[row.key] = (tonumber(row.total) or 0) / 3600
+        end
+
+        totals = {}
+        for _, row in ipairs(netProfitTotals(sinceTimestamp, incomeTable, spendTable, "job", sourceWhere)) do
+            local hours = hoursByJob[row.key]
+            if hours and hours > 0 then
+                totals[#totals + 1] = { key = row.key, total = (tonumber(row.total) or 0) / hours }
+            end
+        end
+        table.sort(totals, function(a, b)
+            return (tonumber(a.total) or 0) > (tonumber(b.total) or 0)
+        end)
+
+        if selectedKey and selectedKey ~= "" then
+            local hoursByBucket = {}
+            for _, row in ipairs(simpleSeries(playtimeDef, selectedKey, sinceTimestamp, groupSeconds)) do
+                hoursByBucket[row.bucket] = (tonumber(row.value) or 0) / 3600
+            end
+
+            series = {}
+            for _, row in ipairs(netProfitSeries(selectedKey, sinceTimestamp, groupSeconds,
+                incomeTable, spendTable, "job", sourceWhere)) do
+                local hours = hoursByBucket[row.bucket]
+                if hours and hours > 0 then
+                    series[#series + 1] = { bucket = row.bucket, value = (tonumber(row.value) or 0) / hours }
+                end
+            end
         end
     elseif categoryID == "weapon_kills_per_hour" then
         totals = ratioTotals("vstats_weapon_kills", "kills", "vstats_weapon_playtime", "seconds", "weapon", sinceTimestamp, 3600)
@@ -737,7 +935,8 @@ function vstats.BuildReport(categoryID, rangeID, selectedKey, sourceFilter)
         range = rangeID,
         selected = selectedKey or "",
         source = sourceFilter,
-        sources = category.unit == "money" and queryMoneySources() or {},
+        sources = (category.unit == "money" and not (categoryID == "money_income_source" or categoryID == "money_spend_source" or categoryID == "money_net_source")) and queryMoneySources() or {},
+        jobs = category.unit == "money" and (categoryID == "money_income_source" or categoryID == "money_spend_source" or categoryID == "money_net_source") and queryMoneySourceJobs() or {},
         totals = totals,
         series = series,
     }
